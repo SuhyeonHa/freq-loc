@@ -10,7 +10,10 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${file}",
-            "console": "integratedTerminal"
+            "console": "integratedTerminal",
+            "env":{
+                "CUDA_VISIBLE_DEVICES": "3"
+            }
         }
     ]
 }
