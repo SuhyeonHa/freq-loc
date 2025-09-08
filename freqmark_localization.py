@@ -16,6 +16,7 @@ import torchvision
 import random
 from tqdm import tqdm
 warnings.filterwarnings('ignore')
+from segment_anything import sam_predictor, SamPredictor, sam_model_registry
 
 class Params:
     """Hyperparameters and configuration settings for FreqMark."""
@@ -73,11 +74,12 @@ class Params:
 class FreqMark:
     def __init__(self, args):
         self.args = args
+        sam = sam_model_registry["<model_type>"](checkpoint="<path/to/checkpoint>")
 
         # Initialize networks
         self.vae = AutoencoderKL.from_pretrained("stabilityai/stable-diffusion-2-1", subfolder="vae").to(self.args.device)
         self.image_encoder = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14').to(self.args.device)
-
+        self.sam = SamPredictor(sam)
         # Freeze all networks
         for param in self.vae.parameters():
             param.requires_grad = False
