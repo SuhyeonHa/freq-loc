@@ -16,7 +16,6 @@ import torchvision
 import random
 from tqdm import tqdm
 warnings.filterwarnings('ignore')
-from segment_anything import sam_predictor, SamPredictor, sam_model_registry
 
 class Params:
     """Hyperparameters and configuration settings for FreqMark."""
@@ -53,8 +52,8 @@ class Params:
         # --- Optimization Parameters ---
         self.lr = 2.0
         self.steps = 400
-        self.lambda_p = 0.01#0.05
-        self.lambda_i = 0.05#0.25
+        self.lambda_p = 0.1#0.05
+        self.lambda_i = 0.25#0.25
 
         # --- Robustness Parameters --- 
         # self.eps1_std = [0.2, 0.6] # Latent noise
@@ -74,12 +73,10 @@ class Params:
 class FreqMark:
     def __init__(self, args):
         self.args = args
-        sam = sam_model_registry["<model_type>"](checkpoint="<path/to/checkpoint>")
 
         # Initialize networks
         self.vae = AutoencoderKL.from_pretrained("stabilityai/stable-diffusion-2-1", subfolder="vae").to(self.args.device)
         self.image_encoder = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14').to(self.args.device)
-        self.sam = SamPredictor(sam)
         # Freeze all networks
         for param in self.vae.parameters():
             param.requires_grad = False
@@ -217,13 +214,14 @@ class FreqMark:
             latent_mask = F.interpolate(mask, size=(64, 64), mode="bilinear", align_corners=False)
             
             std_val_0 = random.uniform(self.args.eps0_std[0], self.args.eps0_std[1])
-            std_val_1 = random.uniform(self.args.eps1_std[0], self.args.eps1_std[1])
+            # std_val_1 = random.uniform(self.args.eps1_std[0], self.args.eps1_std[1])
             eps0 = torch.randn_like(perturbed_latent) * std_val_0
-            eps1 = torch.randn_like(perturbed_latent) * std_val_1
+            # eps1 = torch.randn_like(perturbed_latent) * std_val_1
 
             # large distortion: mask, small distortion: wm
             # perturbed_latent = perturbed_latent*(1-latent_mask) + (perturbed_latent + eps1)*latent_mask
-            perturbed_latent_1 = (perturbed_latent + eps0)*latent_mask + (perturbed_latent + eps1)*(1-latent_mask)
+            perturbed_latent_1 = (perturbed_latent + eps0)*latent_mask + perturbed_latent*(1-latent_mask)
+            # perturbed_latent_1 = perturbed_latent + eps0*latent_mask
 
             # Add robustness noise during training
             # eps1 = torch.randn_like(perturbed_latent) * random.choice(self.args.eps1_std)
@@ -238,6 +236,7 @@ class FreqMark:
             # perturbed_latent_1 = perturbed_latent + eps1
             watermarked_image_1 = self.vae.decode(perturbed_latent_1).sample
             masked_1 = (watermarked_image_1 + 1) / 2
+            masked_1 = masked_1 * mask + (1 - mask) * image ################################
             # # masked_1 = watermarked_image_1 * mask + (1 - mask) * image
             # masked_1 = watermarked_image_1 * mask * alpha + (1 - alpha * mask) * image
 
@@ -633,13 +632,14 @@ def run_freqmark_demo(args=None):
 
     # Create test dataset
     print("Generating test dataset...")
-    test_images, filenames = load_images_from_path('/mnt/nas5/suhyeon/datasets/DIV2K_train_HR', args.num_test_images, transform=args.transform)
-    # test_images = load_image(args.image_path, transform=args.transform)
+    # test_images, filenames = load_images_from_path('/mnt/nas5/suhyeon/datasets/DIV2K_train_HR', args.num_test_images, transform=args.transform)
+    test_images = load_image(args.image_path, transform=args.transform)
 
-    # for i in tqdm(range(args.num_test_images), desc="Embedding Watermarks"):
-    for i in range(args.num_test_images):
+    for i in tqdm(range(args.num_test_images), desc="Embedding Watermarks"):
+    # for i in range(args.num_test_images):
         test_batch = test_images[i:i+1].to(args.device)
-        filename = filenames[i]
+        # filename = filenames[i]
+        filename = '0002.png'
 
         # Embed watermarks
         print("Embedding watermarks...")
