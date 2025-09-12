@@ -17,13 +17,24 @@ import random
 from tqdm import tqdm
 warnings.filterwarnings('ignore')
 
+class Denormalize(transforms.Normalize):
+    def __init__(self, mean, std):
+        mean = torch.tensor(mean)
+        std = torch.tensor(std)
+        self.mean_rev = -mean / std
+        self.std_rev = 1 / std
+        super().__init__(mean=self.mean_rev, std=self.std_rev)
+
+norm_dino = transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+denorm_dino = Denormalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+
 class Params:
     """Hyperparameters and configuration settings for FreqMark."""
     def __init__(self):
         # --- System & Paths ---
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.image_path = '/mnt/nas5/suhyeon/datasets/DIV2K_train_HR/0002.png'
-        self.output_dir = '/mnt/nas5/suhyeon/projects/freq-loc/sensitive_vec'
+        self.output_dir = '/mnt/nas5/suhyeon/projects/freq-loc/secret_code'
 
         # --- Model Configurations ---
         self.vae_model_name = "stabilityai/stable-diffusion-2-1"
@@ -35,14 +46,15 @@ class Params:
         self.vae_image_size = 512
         self.dino_image_size = 224
         self.transform = transforms.Compose([
-        transforms.Resize((256)),
-        transforms.CenterCrop(self.dino_image_size),
-        transforms.ToTensor(),
+            transforms.Resize((256)),
+            transforms.CenterCrop(self.dino_image_size),
+            transforms.ToTensor(),
+            # transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
         ])
 
         # --- FreqMark Core Parameters ---
         self.message_bits = 48
-        self.feature_dim = 384
+        self.feature_dim = 384 # DINOv2 small
         self.margin = 1.0
         # self.grid_size = 14
         # self.num_patches = self.grid_size*self.grid_size
@@ -65,6 +77,8 @@ class Params:
         self.eps1_std = [1.5, 3.0] # Latent noise
         self.eps2_std = 0.06
         self.lambda_reg = 0.01
+
+        self.dino_layer = 1
         
         # --- Demo/Evaluation Parameters ---
         self.batch_size = 1
@@ -84,11 +98,19 @@ class FreqMark:
             param.requires_grad = False
         
         # Pre-define direction vectors
-        self.direction_vectors = torch.load('./sensitive_vec.pt')
+        # self.direction_vectors = torch.load('./sensitive_vec.pt')
+        self.direction_vectors = torch.randn(self.args.feature_dim)
+        self.direction_vectors = F.normalize(self.direction_vectors, p=2, dim=0)
+        self.direction_vectors = self.direction_vectors.unsqueeze(0).to(self.args.device)
+        torch.save(self.direction_vectors, './random_vec.pt')
     
         self.mu = self.args.margin      # Hinge loss margin
+        self.num_patches = (self.args.dino_image_size // 14) ** 2
+        self.secret_key = torch.randint(0, 2, (1, self.num_patches, 1), device=self.args.device) * 2 - 1 # {-1, 1}
 
-    
+        torch.save(self.secret_key, './secret_key.pt')
+
+
     # def _init_direction_vectors(self) -> torch.Tensor:
     #     """Initialize direction vectors as described in paper"""
     #     # binary bit for each patch
@@ -170,6 +192,7 @@ class FreqMark:
         Returns:
             Watermarked image tensor
         """
+
         original = original.to(self.args.device)
         # message = message.to(self.device)
         
@@ -183,7 +206,7 @@ class FreqMark:
         # Step 3: Initialize perturbation (trainable parameter)
         delta_m = torch.zeros_like(latent_fft, requires_grad=True)
         optimizer = optim.Adam([delta_m], lr=self.args.lr)
-        
+
         # Training loop
         # for step in range(self.args.steps):
         for step in tqdm(range(self.args.steps), desc="Embedding Watermark"):
@@ -198,13 +221,10 @@ class FreqMark:
             image = F.interpolate(original, size=(self.args.vae_image_size, self.args.vae_image_size), mode="bilinear", align_corners=False)
             mask = F.interpolate(mask, size=(self.args.vae_image_size, self.args.vae_image_size), mode="bilinear", align_corners=False)
             
-            # Add perturbation in frequency domain
             perturbed_fft = latent_fft + delta_m
             
-            # Transform back to spatial domain
             perturbed_latent = torch.fft.ifft2(perturbed_fft, dim=(-2, -1)).real
             
-            # Generate watermarked image
             watermarked_image = self.vae.decode(perturbed_latent).sample
             watermarked_image = (watermarked_image + 1) / 2
             
@@ -214,38 +234,13 @@ class FreqMark:
             latent_mask = F.interpolate(mask, size=(64, 64), mode="bilinear", align_corners=False)
             
             std_val_0 = random.uniform(self.args.eps0_std[0], self.args.eps0_std[1])
-            # std_val_1 = random.uniform(self.args.eps1_std[0], self.args.eps1_std[1])
             eps0 = torch.randn_like(perturbed_latent) * std_val_0
-            # eps1 = torch.randn_like(perturbed_latent) * std_val_1
 
-            # large distortion: mask, small distortion: wm
-            # perturbed_latent = perturbed_latent*(1-latent_mask) + (perturbed_latent + eps1)*latent_mask
             perturbed_latent_1 = (perturbed_latent + eps0)*latent_mask + perturbed_latent*(1-latent_mask)
-            # perturbed_latent_1 = perturbed_latent + eps0*latent_mask
 
-            # Add robustness noise during training
-            # eps1 = torch.randn_like(perturbed_latent) * random.choice(self.args.eps1_std)
-            # eps2 = torch.randn_like(watermarked_image) * random.choice(self.args.eps2_std)
-
-            # eps0 = torch.randn_like(perturbed_latent) * self.args.eps0_std # weak distirtion
-            # eps1 = torch.randn_like(perturbed_latent) * self.args.eps1_std # strong distortion
-            # eps1 = torch.randn_like(perturbed_latent) * self.args.eps1_std
-            # eps2 = torch.randn_like(watermarked_image) * self.args.eps2_std
-
-            # # Perturbed versions for robustness
-            # perturbed_latent_1 = perturbed_latent + eps1
             watermarked_image_1 = self.vae.decode(perturbed_latent_1).sample
             masked_1 = (watermarked_image_1 + 1) / 2
             masked_1 = masked_1 * mask + (1 - mask) * image ################################
-            # # masked_1 = watermarked_image_1 * mask + (1 - mask) * image
-            # masked_1 = watermarked_image_1 * mask * alpha + (1 - alpha * mask) * image
-
-            # watermarked_image_2 = watermarked_image + eps2
-            # masked_2 = watermarked_image_2 * mask + (1 - mask) * image
-
-            # Perturbed versions for fragility
-            # watermarked_image_3 = self.vae_recon(watermarked_image, iter=3)
-            # masked_3 = watermarked_image_3 * mask + (1 - mask) * image
 
             # Compute losses
             image = F.interpolate(original, size=(img_size, img_size), mode="bilinear", align_corners=False)
@@ -255,37 +250,59 @@ class FreqMark:
             # masked_2 = F.interpolate(masked_2, size=(img_size, img_size), mode="bilinear", align_corners=False)
             # masked_3 = F.interpolate(masked_3, size=(img_size, img_size), mode="bilinear", align_corners=False)
             watermarked_image = F.interpolate(watermarked_image, size=(img_size, img_size), mode="bilinear", align_corners=False)
-
-            # loss_m1 = self._message_loss(watermarked_image, message)
-            # loss_m2 = self._message_loss(watermarked_image_1, message)
-            # loss_m3 = self._message_loss(watermarked_image_2, message)
             
+            watermarked_image = norm_dino(watermarked_image)
+            masked = norm_dino(masked)
+            masked_1 = norm_dino(masked_1)
+
             loss_m = self._mask_loss(masked, mask)
             loss_d = self._dice_loss(masked, mask)
             loss_m1 = self._mask_loss(masked_1, mask)
             loss_d1 = self._dice_loss(masked_1, mask)
-            # loss_m2 = self._mask_loss(masked_2, mask)
-            # loss_m3 = self._mask_loss(masked_3, mask)
+
+            gt_mask_patch = F.avg_pool2d(mask, kernel_size=14, stride=14).view(1, 16*16, 1)
+
+            features = self.image_encoder.get_intermediate_layers(watermarked_image)[0]
+            dot_products = torch.matmul(features, self.direction_vectors.T)
+            loss_auth = self._auth_loss(dot_products, self.secret_key, gt_mask_patch)
+
+            features_1 = self.image_encoder.get_intermediate_layers(masked_1)[0]
+            dot_products_1 = torch.matmul(features_1, self.direction_vectors.T)
+            loss_auth_1 = self._auth_loss(dot_products_1, self.secret_key, gt_mask_patch)
+
+
+            watermarked_image = denorm_dino(watermarked_image)
+            masked = denorm_dino(masked)
+            masked_1 = denorm_dino(masked_1)
 
             loss_psnr = self._psnr_loss(watermarked_image, image)
             loss_lpips = self._lpips_loss(watermarked_image, image)
 
-            # loss_reg = torch.mean(delta_m.real**2)
-            
+            # if step < 200:
+            #     auth_loss_weight = 1.0
+            #     shape_loss_weight = 0.0
+            # else:  # Stage 2: Key Embedding
+            #     auth_loss_weight = 1.0
+            #     shape_loss_weight = 1.0
+
+            auth_loss_weight = 1.0
+            shape_loss_weight = 1.0
+
             # Combined loss (Equation 10 from paper)
-            total_loss = (loss_m + loss_m1 + # loss_m2 + #loss_m3 + 
-                         loss_d + loss_d1 +
-                         self.args.lambda_p * loss_psnr + 
-                         self.args.lambda_i * loss_lpips)
+            total_loss = auth_loss_weight * (loss_auth + loss_auth_1) + \
+                         shape_loss_weight * (loss_m + loss_m1 + loss_d + loss_d1) + \
+                         self.args.lambda_p * loss_psnr + \
+                         self.args.lambda_i * loss_lpips
             
             total_loss.backward()
             optimizer.step()
-            
+
             if step == 0 or (step+1) % 100 == 0:
                 psnr_val = self._compute_psnr(watermarked_image, image)
                 print(f"Step {step+1}, Loss: {total_loss.item():.4f}, PSNR: {psnr_val:.2f}")
-                print(f"Mask Loss: {(loss_m).item():.4f}, DICE Loss: {loss_d.item():.4f}")
+                print(f"Mask Loss: {loss_m.item():.4f}, DICE Loss: {loss_d.item():.4f}")
                 print(f"Mask1 Loss: {(loss_m1).item():.4f}, DICE1 Loss: {loss_d1.item():.4f}")
+                print(f"Auth Loss: {(loss_auth).item():.4f}, Auth1 Loss: {loss_auth_1.item():.4f}")
                 print(f"PSNR Loss: {loss_psnr.item():.4f}, LPIPS Loss: {loss_lpips.item():.4f}")
 
         # Final watermarked image
@@ -311,14 +328,16 @@ class FreqMark:
         with torch.no_grad():
             # Extract features using image encoder
             # features = self.image_encoder(watermarked_image) # [1, 256, 384]
+            watermarked_image = norm_dino(watermarked_image)
             features = self.image_encoder.get_intermediate_layers(watermarked_image)[0] # [1, 256, 384]
             
             # Compute dot products with direction vectors
             dot_products = torch.matmul(features, self.direction_vectors.T) # [1, 256, 384]*[1, 384, 256] -> [1, 256, 1]
-            
+            agreement_scores = dot_products * self.secret_key
+
             B = dot_products.shape[0]
             H = W = int(dot_products.shape[1] ** 0.5)
-            grid = dot_products.view(B, H, W).unsqueeze(0) # [1, 256, 1] -> [1, 1, 16, 16]
+            grid = agreement_scores.view(B, H, W).unsqueeze(0) # [1, 256, 1] -> [1, 1, 16, 16]
             grid = F.interpolate(grid, size=self.args.dino_image_size, mode='bilinear', align_corners=False)
         return grid
     
@@ -339,15 +358,16 @@ class FreqMark:
         The ground truth mask is implicitly all-ones, meaning the loss is minimized when all patches
         correctly embed the watermark.
         """
-        image_for_dino = F.interpolate(watermarked_image, 
-                                       size=(self.args.dino_image_size, self.args.dino_image_size), 
-                                       mode="bilinear", align_corners=False)
+        # image_for_dino = F.interpolate(watermarked_image, 
+        #                                size=(self.args.dino_image_size, self.args.dino_image_size), 
+        #                                mode="bilinear", align_corners=False)
 
-        features = self.image_encoder.get_intermediate_layers(image_for_dino, n=1)[0] # [B, Num_Patches, Feature_Dim]
+        features = self.image_encoder.get_intermediate_layers(watermarked_image)[0] # [B, Num_Patches, Feature_Dim]
         dot_products = torch.matmul(features, self.direction_vectors.T)
+        agreement_scores = dot_products * self.secret_key
         B = dot_products.shape[0]
         H = W = int(dot_products.shape[1] ** 0.5)
-        grid = dot_products.view(B, H, W).unsqueeze(0)
+        grid = agreement_scores.view(B, H, W).unsqueeze(0)
         # grid = dot_products.view(self.args.grid_size, self.args.grid_size).unsqueeze(0).unsqueeze(0) # [1, 256, 1] -> [1, 1, 14, 14]
         grid = F.interpolate(grid, size=self.args.dino_image_size, mode='bilinear', align_corners=False) # [B, Num_Patches, Feature_Dim]*[B, Feature_Dim, 1] = [B, Num_Patches, 1]
         loss = F.binary_cross_entropy_with_logits(grid, gt_mask)
@@ -378,11 +398,12 @@ class FreqMark:
                                        size=(self.args.dino_image_size, self.args.dino_image_size), 
                                        mode="bilinear", align_corners=False)
 
-        features = self.image_encoder.get_intermediate_layers(image_for_dino, n=1)[0] # [B, Num_Patches, Feature_Dim]
+        features = self.image_encoder.get_intermediate_layers(image_for_dino)[0] # [B, Num_Patches, Feature_Dim]
         dot_products = torch.matmul(features, self.direction_vectors.T)
+        agreement_scores = dot_products * self.secret_key
         B = dot_products.shape[0]
         H = W = int(dot_products.shape[1] ** 0.5)
-        grid = dot_products.view(B, H, W).unsqueeze(0)
+        grid = agreement_scores.view(B, H, W).unsqueeze(0)
         # grid = dot_products.view(self.args.grid_size, self.args.grid_size).unsqueeze(0).unsqueeze(0) # [1, 256, 1] -> [1, 1, 14, 14]
         grid = F.interpolate(grid, size=self.args.dino_image_size, mode='bilinear', align_corners=False) # [B, Num_Patches, Feature_Dim]*[B, Feature_Dim, 1] = [B, Num_Patches, 1]
         
@@ -396,6 +417,20 @@ class FreqMark:
         dice_coeff = (2. * intersection + smooth) / (pred.sum() + target.sum() + smooth)
         
         return 1 - dice_coeff
+
+    # def _auth_loss(self, dot_products, secret_key, gt_mask, margin=1.5):
+    #     projections = dot_products * secret_key
+    #     loss = torch.clamp(margin - projections, min=0)
+    #     loss = (loss * gt_mask).mean()
+    #     return loss
+    
+    def _auth_loss(self, dot_products, secret_key, gt_mask):
+        TARGET_SCORE = 4.0
+        target_scores = secret_key * TARGET_SCORE
+        # loss = F.mse_loss(dot_products, target_scores, reduction='none')
+        loss = F.l1_loss(dot_products, target_scores, reduction='none')
+        loss = (loss * gt_mask).mean()
+        return loss
     
     def compute_bit_accuracy(self, original_message: torch.Tensor, 
                            decoded_message: torch.Tensor) -> float:
