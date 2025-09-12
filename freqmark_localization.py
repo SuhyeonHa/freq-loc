@@ -293,15 +293,15 @@ class FreqMark:
             loss_psnr = self._psnr_loss(watermarked_image, image)
             loss_lpips = self._lpips_loss(watermarked_image, image)
 
-            if step < 200:
-                auth_loss_weight = 1.0
-                shape_loss_weight = 0.0
-            else:  # Stage 2: Key Embedding
-                auth_loss_weight = 1.0
-                shape_loss_weight = 1.0
+            # if step < 200:
+            #     auth_loss_weight = 1.0
+            #     shape_loss_weight = 0.0
+            # else:  # Stage 2: Key Embedding
+            #     auth_loss_weight = 0.1
+            #     shape_loss_weight = 1.0
 
-            # auth_loss_weight = 1.0
-            # shape_loss_weight = 1.0
+            auth_loss_weight = 0.5
+            shape_loss_weight = 1.0
 
             # Combined loss (Equation 10 from paper)
             total_loss = auth_loss_weight * (loss_auth + loss_auth_1) + \
@@ -450,8 +450,8 @@ class FreqMark:
     def _auth_loss(self, dot_products, secret_key, gt_mask):
         TARGET_SCORE = 4.0
         target_scores = secret_key * TARGET_SCORE
-        # loss = F.mse_loss(dot_products, target_scores, reduction='none')
-        loss = F.l1_loss(dot_products, target_scores, reduction='none')
+        loss = F.mse_loss(dot_products, target_scores, reduction='none')
+        # loss = F.l1_loss(dot_products, target_scores, reduction='none')
         loss = (loss * gt_mask).mean()
         return loss
     
