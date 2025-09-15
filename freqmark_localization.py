@@ -66,7 +66,7 @@ class Params:
         # --- Optimization Parameters ---
         self.lr = 2.0
         self.steps = 400
-        self.lambda_p = 0.1#0.05
+        self.lambda_p = 0.5#0.05
         self.lambda_i = 0.25#0.25
 
         # --- Robustness Parameters --- 
@@ -456,7 +456,7 @@ class FreqMark:
     #     return loss
     
     def _auth_loss(self, dot_products, secret_key, gt_mask):
-        TARGET_SCORE = 4.0
+        TARGET_SCORE = 5.0
         target_scores = secret_key * TARGET_SCORE
         loss = F.mse_loss(dot_products, target_scores, reduction='none')
         # loss = F.l1_loss(dot_products, target_scores, reduction='none')
