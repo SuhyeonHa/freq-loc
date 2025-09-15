@@ -113,7 +113,7 @@ class FreqMark:
         self.direction_vectors = torch.load('./random_vec.pt').to(self.args.device)
     
         self.mu = self.args.margin      # Hinge loss margin
-        # self.num_patches = (self.args.dino_image_size // 14) ** 2
+        self.num_patches = (self.args.dino_image_size // 14) ** 2
         # self.secret_key = torch.randint(0, 2, (1, self.num_patches, 1), device=self.args.device) * 2 - 1 # {-1, 1}
         # self.secret_key = torch.randint(0, 2, (1, args.grid_size*args.grid_size, 1), device=self.args.device) * 2 - 1 # {-1, 1}
         # torch.save(self.secret_key, './secret_key.pt')
@@ -297,15 +297,23 @@ class FreqMark:
             #     auth_loss_weight = 1.0
             #     shape_loss_weight = 0.0
             # else:  # Stage 2: Key Embedding
-            #     auth_loss_weight = 0.1
+            #     auth_loss_weight = 1.0 
             #     shape_loss_weight = 1.0
 
-            auth_loss_weight = 0.5
-            shape_loss_weight = 1.0
+            # auth_loss_weight = 0.5
+            # shape_loss_weight = 1.0
 
             # Combined loss (Equation 10 from paper)
-            total_loss = auth_loss_weight * (loss_auth + loss_auth_1) + \
-                         shape_loss_weight * (loss_m + loss_m1 + loss_d + loss_d1) + \
+            # total_loss = auth_loss_weight * (loss_auth + loss_auth_1) + \
+            #              shape_loss_weight * (loss_m + loss_m1 + loss_d + loss_d1) + \
+            #              self.args.lambda_p * loss_psnr + \
+            #              self.args.lambda_i * loss_lpips
+
+            clean_weight = 1.0
+            noisy_weight = 1.0
+            
+            total_loss = clean_weight * (loss_auth + loss_m + loss_d) + \
+                         noisy_weight * (loss_auth_1 + loss_m1 + loss_d1) + \
                          self.args.lambda_p * loss_psnr + \
                          self.args.lambda_i * loss_lpips
             
