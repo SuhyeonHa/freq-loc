@@ -52,7 +52,7 @@ class Params:
         self.margin = 1.0
         self.grid_size = 28
         # self.num_patches = self.grid_size*self.grid_size
-        self.mask_percentage = 0.3
+        self.mask_percentage = 0.5
         self.num_masks = 1
         self.last_grad_steps = 2
         self.num_inference_steps = 50

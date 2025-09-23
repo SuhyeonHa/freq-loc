@@ -10,14 +10,14 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import cv2
 from typing import Tuple, List, Optional
-from diffusers import AutoencoderKL
+from diffusers import AutoencoderKL, StableDiffusionInpaintPipeline
 import os
 import warnings 
 import torchvision
 import random
 from tqdm import tqdm
 import timm
-from custom_inpaint import CustomInpaintPipeline
+# from custom_inpaint import CustomInpaintPipeline
 warnings.filterwarnings('ignore')
 
 class Denormalize(transforms.Normalize):
@@ -30,17 +30,6 @@ class Denormalize(transforms.Normalize):
 
 norm_dino = transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
 denorm_dino = Denormalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
-
-def decode_and_save(latent_tensor, vae, filename):
-    # 이 함수는 그래디언트 계산이 필요 없으므로 no_grad() 사용
-    with torch.no_grad():
-        # 1. VAE 입력에 맞게 스케일 축소
-        # latents_for_decode = latent_tensor / vae.config.scaling_factor
-        # 2. 이미지 텐서로 디코딩 (범위: [-1, 1])
-        decoded_image = vae.decode(latent_tensor).sample
-        # 3. 저장 가능한 [0, 1] 범위로 정규화
-        image_to_save = (decoded_image + 1) / 2
-        torchvision.utils.save_image(image_to_save, filename)
 
 class Params:
     """Hyperparameters and configuration settings for FreqMark."""
@@ -60,8 +49,8 @@ class Params:
         self.vae_image_size = 512
         self.dino_image_size = 224
         self.transform = transforms.Compose([
-            transforms.Resize((256)),
-            transforms.CenterCrop(self.dino_image_size),
+            transforms.Resize((self.vae_image_size)),
+            transforms.CenterCrop(self.vae_image_size),
             transforms.ToTensor(),
             # transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
         ])
@@ -76,15 +65,15 @@ class Params:
         self.mask_percentage = 0.3
         self.num_masks = 1
         self.last_grad_steps = 2
-        self.num_inference_steps = 20
+        self.num_inference_steps = 100
         self.seed = 42
         self.guidance_scale = 7.5
 
         # --- Optimization Parameters ---
         self.lr = 2.0
         self.steps = 400
-        self.lambda_p = 0.005#0.025#0.5#0.05
-        self.lambda_i = 0.001#0.25
+        self.lambda_p = 0.05#0.025#0.5#0.05
+        self.lambda_i = 0.01#0.25
 
         # --- Robustness Parameters --- 
         # self.eps1_std = [0.2, 0.6] # Latent noise
@@ -115,7 +104,7 @@ class FreqMark:
             pretrained=True,
             features_only=True,
         ).to(self.args.device)
-        self.pipe = CustomInpaintPipeline.from_pretrained(
+        self.pipe = StableDiffusionInpaintPipeline.from_pretrained(
             "sd-legacy/stable-diffusion-inpainting",
             # torch_dtype=torch.float16,
             cache_dir='/mnt/nas5/suhyeon/caches'
@@ -252,19 +241,22 @@ class FreqMark:
             Watermarked image tensor
         """
 
-        original = original.to(self.args.device)
+        image = original.to(self.args.device)
         # message = message.to(self.device)
 
         prompt_embeds = self.pipe._encode_prompt([""], self.args.device, 1, True, None)
         self.pipe.scheduler.set_timesteps(self.args.num_inference_steps, device=self.args.device)
-        timesteps, num_inference_steps = self.pipe.get_timesteps(self.args.num_inference_steps, 1.0, self.args.device)
-        
-        generator = torch.Generator(self.args.device).manual_seed(self.args.seed)
+        timesteps = self.pipe.scheduler.timesteps
+        # target_steps = timesteps[-70:]
+        target_steps = timesteps
+
+        generator = torch.Generator(device="cpu").manual_seed(self.args.seed)
+        noise_generator = torch.Generator(device=self.args.device).manual_seed(self.args.seed)
 
         # Step 1: Encode image to latent space
-        image = F.interpolate(original, size=(self.args.vae_image_size, self.args.vae_image_size), mode="bilinear", align_corners=False)
-        latent = self.pipe.vae.encode(2*image-1).latent_dist.sample(generator=generator) # [-1, 1], [B,4,64,64]
-        # latent = latent * self.pipe.vae.config.scaling_factor
+        # image = F.interpolate(original, size=(self.args.vae_image_size, self.args.vae_image_size), mode="bilinear", align_corners=False)
+        latent = self.pipe.vae.encode(2*image-1).latent_dist.sample(generator=noise_generator) # [-1, 1], [B,4,64,64]
+        latent = latent * self.pipe.vae.config.scaling_factor
 
         # Step 2: Transform to frequency domain
         latent_fft = torch.fft.fft2(latent, dim=(-2, -1)).detach()
@@ -273,88 +265,117 @@ class FreqMark:
         delta_m = torch.zeros_like(latent_fft, requires_grad=True)
         optimizer = optim.Adam([delta_m], lr=self.args.lr)
 
+        epsilon = torch.randn(latent.shape, generator=noise_generator, device=self.args.device, dtype=latent.dtype).detach()
+        # epsilon_prime = torch.randn(latent.shape, generator=noise_generator, device=self.args.device, dtype=latent.dtype).detach()
+        # epsilon_prime = torch.zeros_like(latent, device=self.args.device, dtype=latent.dtype).detach()
+        # epsilon_perturb = torch.randn(latent.shape, generator=noise_generator, device=self.args.device, dtype=latent.dtype).detach()
+        # epsilon_prime = epsilon + 0.02 * epsilon_perturb
         # Training loop
         # for step in range(self.args.steps):
         for step in tqdm(range(self.args.steps), desc="Embedding Watermark"):
             optimizer.zero_grad()
 
-            perturbed_fft = latent_fft + delta_m
-            watermarked_latent = torch.fft.ifft2(perturbed_fft, dim=(-2, -1)).real
-            # watermarked_latent = watermarked_latent / self.pipe.vae.config.scaling_factor
-            watermarked_image = self.pipe.vae.decode(watermarked_latent).sample
-            watermarked_image = (watermarked_image + 1) / 2
-
-            watermarked_latent = watermarked_latent * self.pipe.vae.config.scaling_factor
-
             mask = self._create_random_mask(image, num_masks=1, mask_percentage=self.args.mask_percentage)
-            
             if random.random() < 0.5:
                 mask = 1 - mask
 
-            inpaint_mask = (1-mask).to(self.args.device)
-            # image = F.interpolate(original, size=(self.args.vae_image_size, self.args.vae_image_size), mode="bilinear", align_corners=False)
-            mask_latent = F.interpolate(inpaint_mask, size=(latent.shape[2], latent.shape[3]))
-            masked_latent = watermarked_latent * (1-mask_latent) # remain
+            perturbed_fft = latent_fft + delta_m
+            watermarked_latent = torch.fft.ifft2(perturbed_fft, dim=(-2, -1)).real
+            watermarked_latent_vis = watermarked_latent / self.pipe.vae.config.scaling_factor
+            watermarked_image = self.pipe.vae.decode(watermarked_latent_vis).sample
+            watermarked_image = (watermarked_image + 1) / 2
 
-            noise = torch.randn(watermarked_latent.shape, generator=generator, device=self.args.device, dtype=watermarked_latent.dtype)
-            current_latent = self.pipe.scheduler.add_noise(watermarked_latent, noise, timesteps[0])
-            grad_start_step = len(timesteps) - self.args.last_grad_steps
+            masked = watermarked_image * mask + (1 - mask) * image
 
-            # --- 4. Denoising Loop ---
-            for i, t in enumerate(timesteps):
-                latent_model_input = torch.cat([current_latent] * 2)
-                latent_model_input = self.pipe.scheduler.scale_model_input(latent_model_input, t)
-                unet_mask = torch.cat([mask_latent] * 2)
-                unet_context = torch.cat([watermarked_latent] * 2)
-    
-                latent_model_input = torch.cat([latent_model_input, unet_mask, unet_context], dim=1)
+            # watermarked_latent = watermarked_latent * self.pipe.vae.config.scaling_factor
+            
+            inpaint_mask_latent = F.interpolate(1-mask, size=(latent.shape[2], latent.shape[3]))
+            inpaint_mask_latent = (inpaint_mask_latent > 0.5).to(dtype=latent.dtype)
 
-                if i < grad_start_step:
-                    with torch.no_grad():
-                        noise_pred = self.pipe.unet(latent_model_input, t, encoder_hidden_states=prompt_embeds, return_dict=False)[0]
-                else:
-                    noise_pred = self.pipe.unet(latent_model_input, t, encoder_hidden_states=prompt_embeds, return_dict=False)[0]
+        
+            # start_index = len(timesteps) - 3
+            # end_index = len(timesteps) - 1
+            # random_index = torch.randint(start_index, end_index, (1,), generator=generator).item()
+            # target_timestep = timesteps[random_index]
+            
+            # with torch.no_grad():
+            #     epsilon = torch.randn(watermarked_latent.shape, generator=noise_generator, device=self.args.device, dtype=watermarked_latent.dtype)
+            #     epsilon_prime = torch.randn(watermarked_latent.shape, generator=noise_generator, device=self.args.device, dtype=watermarked_latent.dtype)
+            
+            # within target steps
+            # current_latent = self.pipe.scheduler.add_noise(watermarked_latent, epsilon, target_steps[0])
 
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + self.args.guidance_scale * (noise_pred_text - noise_pred_uncond)
-                
-                step_output = self.pipe.scheduler.step(noise_pred, t, current_latent, return_dict=False)
+            # for t in target_steps[:20]:
+            #     # simulated_noise_pred = epsilon * (1 - inpaint_mask_latent) + epsilon_prime * inpaint_mask_latent
+            #     x_prev = self.pipe.scheduler.step(epsilon, t, current_latent, return_dict=False)[0]
+            #     current_latent = x_prev
 
-                if i < grad_start_step:
-                    current_latent = step_output[0].clone()
-                else:
-                    with torch.enable_grad():
-                        current_latent = step_output[0]
+            # # attacked_latent = current_latent
+            # attacked_latent = current_latent * (1 - inpaint_mask_latent) + latent * inpaint_mask_latent
 
-            current_latent = 1 / self.pipe.vae.config.scaling_factor * current_latent
-            image_edit = self.pipe.vae.decode(current_latent).sample
-            img_edit = (image_edit + 1) / 2
+            ## total step
+            target_timestep = timesteps[20]
+            # epsilon_prime = torch.randn(watermarked_latent.shape, generator=noise_generator, device=self.args.device, dtype=watermarked_latent.dtype)
+
+            noisy_latent = self.pipe.scheduler.add_noise(watermarked_latent, epsilon, target_timestep)
+
+            alpha_prod_t = self.pipe.scheduler.alphas_cumprod[target_timestep]
+            sqrt_alpha_prod_t = alpha_prod_t ** 0.5                  # A_t
+            sqrt_one_minus_alpha_prod_t = (1 - alpha_prod_t) ** 0.5  # B_t
+
+            pred_original_latent = (noisy_latent - sqrt_one_minus_alpha_prod_t * epsilon) / sqrt_alpha_prod_t
+
+            # noisy_latent = self.pipe.scheduler.add_noise(watermarked_latent, epsilon, target_timestep)
+            # pred_original_latent_outside = (noisy_latent - sqrt_one_minus_alpha_prod_t * epsilon) / sqrt_alpha_prod_t
+            # pred_original_latent_inside = (noisy_latent - sqrt_one_minus_alpha_prod_t * epsilon_prime) / sqrt_alpha_prod_t
+            
+            # z0
+            attacked_latent = pred_original_latent * (1 - inpaint_mask_latent) + latent * inpaint_mask_latent
+            
+            # use unet once
+            # target_timestep = timesteps[20]
+
+            # epsilon = torch.randn(watermarked_latent.shape, generator=noise_generator, device=self.args.device, dtype=watermarked_latent.dtype)
+            # noisy_latent = self.pipe.scheduler.add_noise(watermarked_latent, epsilon, target_timestep)
+
+            # latent_model_input = torch.cat([noisy_latent] * 2)
+            # latent_model_input = self.pipe.scheduler.scale_model_input(latent_model_input, target_timestep)
+            # unet_mask = torch.cat([(inpaint_mask_latent)] * 2)
+            # unet_context = torch.cat([watermarked_latent] * 2)
+            # latent_model_input = torch.cat([latent_model_input, unet_mask, unet_context], dim=1)
+            
+            # realistic_noise_pred = self.pipe.unet(latent_model_input, target_timestep, encoder_hidden_states=prompt_embeds, return_dict=False)[0]
+            
+            # noise_pred_uncond, noise_pred_text = realistic_noise_pred.chunk(2)
+            # realistic_noise_pred = noise_pred_uncond + self.args.guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+            # # 4. DDIM Inversion
+            # alpha_prod_t = self.pipe.scheduler.alphas_cumprod[target_timestep]
+            # sqrt_alpha_prod_t = alpha_prod_t ** 0.5
+            # sqrt_one_minus_alpha_prod_t = (1 - alpha_prod_t) ** 0.5
+            
+            # pred_outside = (noisy_latent - sqrt_one_minus_alpha_prod_t * realistic_noise_pred) / sqrt_alpha_prod_t
+
+            # attacked_latent = pred_outside * (1 - inpaint_mask_latent) + latent * inpaint_mask_latent
+
+            img_edit = self.pipe.vae.decode(1 / self.pipe.vae.config.scaling_factor * attacked_latent).sample
+            img_edit = (img_edit + 1) / 2
             img_edit = img_edit.clamp(0, 1)
 
-            # Compute losses
-            image = F.interpolate(original, size=(img_size, img_size), mode="bilinear", align_corners=False)
-            img_edit = F.interpolate(img_edit, size=(img_size, img_size), mode="bilinear", align_corners=False)
-            mask = F.interpolate(mask, size=(img_size, img_size), mode="bilinear", align_corners=False)
-            # masked = F.interpolate(masked, size=(img_size, img_size), mode="bilinear", align_corners=False)
-            # masked_1 = F.interpolate(masked_1, size=(img_size, img_size), mode="bilinear", align_corners=False)
-            # masked_2 = F.interpolate(masked_2, size=(img_size, img_size), mode="bilinear", align_corners=False)
-            # masked_3 = F.interpolate(masked_3, size=(img_size, img_size), mode="bilinear", align_corners=False)
-            watermarked_image = F.interpolate(watermarked_image, size=(img_size, img_size), mode="bilinear", align_corners=False)
-            
-            watermarked_image = norm_dino(watermarked_image)
-            img_edit = norm_dino(img_edit)
-            # masked = norm_dino(masked)
+            img_edit_loc = norm_dino(img_edit)
+            masked_loc = norm_dino(masked)
             # masked_1 = norm_dino(masked_1)
 
             # k = self.args.dino_image_size//self.args.grid_size
-            # gt_mask_patch = F.interpolate(mask, size=(self.args.grid_size, self.args.grid_size), mode="bilinear", align_corners=False)
+            # k = int(self.args.vae_image_size // 8)
+            # mask_down = F.interpolate(mask, size=(k, k), mode="bilinear", align_corners=False)
             # gt_mask_patch = gt_mask_patch.view(1, self.args.grid_size*self.args.grid_size, 1)
             # gt_mask_patch = F.avg_pool2d(mask, kernel_size=k, stride=k).view(1, self.args.grid_size*self.args.grid_size, 1)
 
-            loss_m = self._mask_loss(img_edit, mask)
-            loss_d = self._dice_loss(img_edit, mask)
-            # loss_m1 = self._mask_loss(masked_1, mask)
-            # loss_d1 = self._dice_loss(masked_1, mask)
+            loss_m = self._mask_loss(img_edit_loc, mask)
+            loss_d = self._dice_loss(img_edit_loc, mask)
+            loss_m1 = self._mask_loss(masked_loc, mask)
+            loss_d1 = self._dice_loss(masked_loc, mask)
             # loss_auth = self._absolute_auth_loss(masked, gt_mask_patch)
             # loss_auth1 = self._absolute_auth_loss(masked_1, gt_mask_patch)
 
@@ -378,10 +399,10 @@ class FreqMark:
             # # loss_auth_1 = self._auth_loss(dot_products_1, self.secret_key, gt_mask_patch)
             # loss_auth_1 = self._absolute_auth_loss(dot_products_1, gt_mask_patch)
 
-            watermarked_image = denorm_dino(watermarked_image)
+            # watermarked_image = denorm_dino(watermarked_image)
             # masked = denorm_dino(masked)
             # masked_1 = denorm_dino(masked_1)
-            img_edit = denorm_dino(img_edit)
+            # img_edit_loc = denorm_dino(img_edit_loc)
 
             loss_psnr = self._psnr_loss(watermarked_image, image)
             loss_lpips = self._lpips_loss(watermarked_image, image)
@@ -391,12 +412,12 @@ class FreqMark:
             #     self.args.lambda_p * loss_psnr + 
             #     self.args.lambda_i * loss_lpips)
 
-            # if step < 200:
-            #     auth_loss_weight = 1.0
-            #     shape_loss_weight = 0.0
-            # else:  # Stage 2: Key Embedding
-            #     auth_loss_weight = 1.0 
-            #     shape_loss_weight = 1.0
+            if step < 200:
+                clean_weight = 1.0
+                noisy_weight = 0.0
+            else:  # Stage 2: Key Embedding
+                clean_weight = 1.0
+                noisy_weight = 1.0
 
             # auth_loss_weight = 0.5
             # shape_loss_weight = 1.0
@@ -407,10 +428,11 @@ class FreqMark:
             #              self.args.lambda_p * loss_psnr + \
             #              self.args.lambda_i * loss_lpips
 
-            clean_weight = 1.0
-            # noisy_weight = 1.0
+            # clean_weight = 1.0
+            # noisy_weight = 0.
             
-            total_loss = clean_weight * (loss_m + loss_d) + \
+            total_loss = noisy_weight * (loss_m + loss_d) + \
+                         clean_weight * (loss_m1 + loss_d1) + \
                          self.args.lambda_p * loss_psnr + \
                          self.args.lambda_i * loss_lpips
             
@@ -421,43 +443,44 @@ class FreqMark:
                 psnr_val = self._compute_psnr(watermarked_image.detach(), image.detach())
                 print(f"Step {step+1}, Loss: {total_loss.item():.4f}, PSNR: {psnr_val:.2f}")
                 print(f"Mask Loss: {loss_m.item():.4f}, DICE Loss: {loss_d.item():.4f}")
-                # print(f"Mask1 Loss: {(loss_m1).item():.4f}, DICE1 Loss: {loss_d1.item():.4f}")
+                print(f"Mask1 Loss: {(loss_m1).item():.4f}, DICE1 Loss: {loss_d1.item():.4f}")
                 # print(f"Auth Loss: {(loss_auth).item():.4f}, Auth1 Loss: {loss_auth1.item():.4f}")
                 print(f"PSNR Loss: {loss_psnr.item():.4f}, LPIPS Loss: {loss_lpips.item():.4f}")
 
-                # # Save images for analysis
-                torchvision.utils.save_image(watermarked_image.detach(), os.path.join(args.output_dir, f"analysis_dist_wm_step{step+1}.png"))
-                torchvision.utils.save_image(img_edit.detach(), os.path.join(args.output_dir, f"analysis_dist_inpaint_step{step+1}.png"))
-                # # torchvision.utils.save_image(masked.detach(), os.path.join(args.output_dir, f"analysis_dist_masked_step{step+1}.png"))
-                # # torchvision.utils.save_image(masked_1.detach(), os.path.join(args.output_dir, f"analysis_dist_masked1_step{step+1}.png"))
+            #     # # Save images for analysis
+            #     torchvision.utils.save_image(watermarked_image.detach(), os.path.join(args.output_dir, f"analysis_dist_wm_step{step+1}.png"))
+            #     torchvision.utils.save_image(img_edit.detach(), os.path.join(args.output_dir, f"analysis_dist_inpaint_step{step+1}.png"))
+            #     # # torchvision.utils.save_image(masked.detach(), os.path.join(args.output_dir, f"analysis_dist_masked_step{step+1}.png"))
+            #     # # torchvision.utils.save_image(masked_1.detach(), os.path.join(args.output_dir, f"analysis_dist_masked1_step{step+1}.png"))
 
-                sig_w = torch.sigmoid(self.decode_watermark(watermarked_image.detach())).cpu().numpy().flatten()
-                sig_e = torch.sigmoid(self.decode_watermark(img_edit.detach())).cpu().numpy().flatten()
-                # # sig_m = torch.sigmoid(self.decode_watermark(masked.detach())).cpu().numpy().flatten()
-                # # sig_m1 = torch.sigmoid(self.decode_watermark(masked_1.detach())).cpu().numpy().flatten()
+            #     sig_w = torch.sigmoid(self.decode_watermark(watermarked_image.detach())).cpu().numpy().flatten()
+            #     sig_e = torch.sigmoid(self.decode_watermark(img_edit.detach())).cpu().numpy().flatten()
+            #     # # sig_m = torch.sigmoid(self.decode_watermark(masked.detach())).cpu().numpy().flatten()
+            #     # # sig_m1 = torch.sigmoid(self.decode_watermark(masked_1.detach())).cpu().numpy().flatten()
 
-                print(f"[A: Watermarked] Mean: {sig_w.mean():.2f}, Std: {sig_w.std():.2f}, Min: {sig_w.min():.2f}, Max: {sig_w.max():.2f}")
-                print(f"[B: Inpaint] Mean: {sig_e.mean():.2f}, Std: {sig_e.std():.2f}, Min: {sig_e.min():.2f}, Max: {sig_e.max():.2f}")
-                # print(f"[B: Spliced] Mean: {sig_m.mean():.2f}, Std: {sig_m.std():.2f}, Min: {sig_m.min():.2f}, Max: {sig_m.max():.2f}")
-                # print(f"[C: Noisy Spliced] Mean: {sig_m1.mean():.2f}, Std: {sig_m1.std():.2f}, Min: {sig_m1.min():.2f}, Max: {sig_m1.max():.2f}")
+            #     print(f"[A: Watermarked] Mean: {sig_w.mean():.2f}, Std: {sig_w.std():.2f}, Min: {sig_w.min():.2f}, Max: {sig_w.max():.2f}")
+            #     print(f"[B: Inpaint] Mean: {sig_e.mean():.2f}, Std: {sig_e.std():.2f}, Min: {sig_e.min():.2f}, Max: {sig_e.max():.2f}")
+            #     # print(f"[B: Spliced] Mean: {sig_m.mean():.2f}, Std: {sig_m.std():.2f}, Min: {sig_m.min():.2f}, Max: {sig_m.max():.2f}")
+            #     # print(f"[C: Noisy Spliced] Mean: {sig_m1.mean():.2f}, Std: {sig_m1.std():.2f}, Min: {sig_m1.min():.2f}, Max: {sig_m1.max():.2f}")
 
-                plt.figure(figsize=(10, 6))
-                plt.hist(sig_w, bins=50, alpha=0.5, label='A: Watermarked')
-                plt.hist(sig_e, bins=50, alpha=0.5, label='B: Inpaint')
-                # plt.hist(sig_m, bins=50, alpha=0.5, label='B: Spliced')
-                # plt.hist(sig_m1, bins=50, alpha=0.5, label='C: Noisy Spliced')
-                plt.title(f'Logit Distribution Comparison: Step {step+1}')
-                plt.xlabel('Logit Value')
-                plt.ylabel('Frequency')
-                plt.legend()
-                plt.grid(True)
-                plt.savefig(os.path.join(args.output_dir, f"analysis_dist_step{step+1}.png"), bbox_inches='tight')
+            #     plt.figure(figsize=(10, 6))
+            #     plt.hist(sig_w, bins=50, alpha=0.5, label='A: Watermarked')
+            #     plt.hist(sig_e, bins=50, alpha=0.5, label='B: Inpaint')
+            #     # plt.hist(sig_m, bins=50, alpha=0.5, label='B: Spliced')
+            #     # plt.hist(sig_m1, bins=50, alpha=0.5, label='C: Noisy Spliced')
+            #     plt.title(f'Logit Distribution Comparison: Step {step+1}')
+            #     plt.xlabel('Logit Value')
+            #     plt.ylabel('Frequency')
+            #     plt.legend()
+            #     plt.grid(True)
+            #     plt.savefig(os.path.join(args.output_dir, f"analysis_dist_step{step+1}.png"), bbox_inches='tight')
 
         # Final watermarked image
         final_fft = latent_fft + delta_m
         final_latent = torch.fft.ifft2(final_fft, dim=(-2, -1)).real
-        final_watermarked = self.pipe.vae.decode(final_latent).sample
+        final_watermarked = self.pipe.vae.decode(1 / self.pipe.vae.config.scaling_factor * final_latent).sample
         final_watermarked = (final_watermarked + 1) / 2
+        final_watermarked = final_watermarked.clamp(0, 1)
         
         return final_watermarked.detach()
     
@@ -488,7 +511,7 @@ class FreqMark:
             B = dot_products.shape[0]
             H = W = int(dot_products.shape[1] ** 0.5)
             grid = dot_products.view(B, H, W).unsqueeze(0) # [1, 256, 1] -> [1, 1, 16, 16]
-            grid = F.interpolate(grid, size=self.args.dino_image_size, mode='bilinear', align_corners=False)
+            grid = F.interpolate(grid, size=self.args.vae_image_size, mode='bilinear', align_corners=False)
         return grid
     
     def _message_loss(self, watermarked_image: torch.Tensor, message: torch.Tensor) -> torch.Tensor:
@@ -522,7 +545,7 @@ class FreqMark:
         H = W = int(dot_products.shape[1] ** 0.5)
         grid = dot_products.view(B, H, W).unsqueeze(0)
         # grid = dot_products.view(self.args.grid_size, self.args.grid_size).unsqueeze(0).unsqueeze(0) # [1, 256, 1] -> [1, 1, 14, 14]
-        grid = F.interpolate(grid, size=self.args.dino_image_size, mode='bilinear', align_corners=False) # [B, Num_Patches, Feature_Dim]*[B, Feature_Dim, 1] = [B, Num_Patches, 1]
+        grid = F.interpolate(grid, size=self.args.vae_image_size, mode='bilinear', align_corners=False) # [B, Num_Patches, Feature_Dim]*[B, Feature_Dim, 1] = [B, Num_Patches, 1]
         loss = F.binary_cross_entropy_with_logits(grid, gt_mask)
         return loss
     
@@ -561,7 +584,7 @@ class FreqMark:
         H = W = int(dot_products.shape[1] ** 0.5)
         grid = dot_products.view(B, H, W).unsqueeze(0)
         # grid = dot_products.view(self.args.grid_size, self.args.grid_size).unsqueeze(0).unsqueeze(0) # [1, 256, 1] -> [1, 1, 14, 14]
-        grid = F.interpolate(grid, size=self.args.dino_image_size, mode='bilinear', align_corners=False) # [B, Num_Patches, Feature_Dim]*[B, Feature_Dim, 1] = [B, Num_Patches, 1]
+        grid = F.interpolate(grid, size=self.args.vae_image_size, mode='bilinear', align_corners=False) # [B, Num_Patches, Feature_Dim]*[B, Feature_Dim, 1] = [B, Num_Patches, 1]
         
         pred = torch.sigmoid(grid) # Logits to probabilities
 
@@ -589,7 +612,7 @@ class FreqMark:
     #     return loss
     
     def _absolute_auth_loss(self, image, gt_mask, TARGET_SCORE = 3.0):
-        features = self.image_encoder(image)[1]
+        features = self.image_encoder(image)[2]
         B, C, H, W = features.shape
         features = features.permute(0, 2, 3, 1).view(B, H * W, C)
         dot_products = torch.matmul(features, self.direction_vectors.T)
@@ -847,7 +870,7 @@ def run_freqmark_demo(args=None):
 
         # Decode watermarks
         print("Decoding watermarks...")
-        watermarked_batch = F.interpolate(watermarked_batch, size=(args.dino_image_size, args.dino_image_size), mode="bilinear", align_corners=False)
+        # watermarked_batch = F.interpolate(watermarked_batch, size=(args.dino_image_size, args.dino_image_size), mode="bilinear", align_corners=False)
         decoded_batch = freqmark.decode_watermark(watermarked_batch)
 
         psnr = freqmark._compute_psnr(test_batch, watermarked_batch)
@@ -1037,7 +1060,7 @@ def analyze_frequency_domain_advantage(args=None):
         original = test_images.clone().to(args.device)
         message = generate_random_messages(args.num_test_images, args.message_bits).to(args.device)
 
-        original = F.interpolate(original, size=(args.dino_image_size, args.dino_image_size), mode="bilinear", align_corners=False)
+        # original = F.interpolate(original, size=(args.dino_image_size, args.dino_image_size), mode="bilinear", align_corners=False)
         
         if space_type == 'pixel':
             # Direct pixel optimization
